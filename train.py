@@ -1,4 +1,5 @@
 # /opt/data/private/BlackBox/train.py
+# 退回到train_t03.py，增加学习率调度器和训练曲线可视化
 import os
 import math
 import random

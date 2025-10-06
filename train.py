@@ -1,4 +1,5 @@
-# /opt/data/private/BlackBox/train.py train_05
+# 05基础上修复patch旋转黑角问题
+# /opt/data/private/BlackBox/train.py train_08
 import os
 import math
 import random
@@ -124,19 +125,29 @@ def detr_boxes_to_xyxy_pixel(pred_boxes):
         pb[:, 3] = pb[:, 3] * MODEL_INPUT_H
     return box_convert(pb, in_fmt='cxcywh', out_fmt='xyxy').cpu()
 
-def paste_patch_via_mask(base_img: torch.Tensor, patch_tensor: torch.Tensor, center_xy: tuple):
+def paste_patch_via_mask(base_img: torch.Tensor, patch_tensor: torch.Tensor, patch_mask: torch.Tensor, center_xy: tuple):
     """
+    修复黑角：用Patch旋转后的有效掩码替代矩形掩码，仅粘贴非黑角区域
     base_img: (3,H,W) tensor
-    patch_tensor: (1,3,ph,pw) or (3,ph,pw)
+    patch_tensor: (1,3,ph,pw) or (3,ph,pw) — 旋转后的Patch
+    patch_mask: (1,1,ph,pw) or (1,ph,pw) — 旋转后的有效区域掩码（1=有效，0=黑角）
     center_xy: (cx, cy) in pixel coords (float)
     returns new image tensor with patch pasted (keeps grad).
     """
+    # 统一Patch格式为(3, ph, pw)
     if patch_tensor.dim() == 4 and patch_tensor.shape[0] == 1:
         p = patch_tensor[0]
     elif patch_tensor.dim() == 3:
         p = patch_tensor
     else:
         raise ValueError("Patch形状无效：需为[1,3,ph,pw]或[3,ph,pw]")
+    # 统一掩码格式为(1, ph, pw)
+    if patch_mask.dim() == 4 and patch_mask.shape[0] == 1:
+        m = patch_mask[0]
+    elif patch_mask.dim() == 3 and patch_mask.shape[0] == 1:
+        m = patch_mask
+    else:
+        raise ValueError("掩码形状无效：需为[1,1,ph,pw]或[1,ph,pw]")
 
     ph, pw = p.shape[1], p.shape[2]
     cx, cy = int(round(center_xy[0])), int(round(center_xy[1]))
@@ -148,6 +159,7 @@ def paste_patch_via_mask(base_img: torch.Tensor, patch_tensor: torch.Tensor, cen
     dst_x0, dst_y0 = x0, y0
     dst_x1, dst_y1 = x0 + pw, y0 + ph
 
+    # 边界裁剪（避免Patch超出图像）
     if dst_x0 < 0:
         src_x0 = -dst_x0; dst_x0 = 0
     if dst_y0 < 0:
@@ -162,32 +174,27 @@ def paste_patch_via_mask(base_img: torch.Tensor, patch_tensor: torch.Tensor, cen
     if out_w <= 0 or out_h <= 0:
         return base_img.clone()
 
+    # 裁剪Patch和对应的掩码（仅保留有效区域）
     src_x1 = src_x0 + out_w
     src_y1 = src_y0 + out_h
     p_cropped = p[:, src_y0:src_y1, src_x0:src_x1]
+    m_cropped = m[:, src_y0:src_y1, src_x0:src_x1]  # 裁剪掩码，与Patch对应
 
+    # 用裁剪后的掩码替代原矩形掩码，避免黑角
     mask = torch.zeros_like(base_img)
-    mask[:, dst_y0:dst_y1, dst_x0:dst_x1] = 1.0
+    mask[:, dst_y0:dst_y1, dst_x0:dst_x1] = m_cropped  # 仅有效区域为1，黑角为0
     padded_patch = torch.zeros_like(base_img)
     padded_patch[:, dst_y0:dst_y1, dst_x0:dst_x1] = p_cropped
     return base_img * (1.0 - mask) + padded_patch * mask
 
 # -----------------------
-# Patch Transformation (single-sample) — only operates on the patch tensor
+# Patch Transformation (single-sample) — 新增掩码生成，解决黑角
 # -----------------------
 def transform_single_patch(patch_tensor: torch.Tensor):
     """
-    Apply one random differentiable transform to the patch tensor:
-      - random rotation angle in TRANS_ROT_ANGLE (degrees)
-      - random brightness factor in TRANS_BRIGHTNESS
-      - random small scale factor in TRANS_SCALE (implemented via interpolate)
-    Input: patch_tensor: shape [1,3,H,W] or [3,H,W], torch.float (0..1)
-    Output: transformed patch with same shape and device, gradient preserved.
-    NOTE: This is a single-sample transform (paper-aligned). If USE_EOT True, multiple
-    transformed copies can be averaged externally.
+    修复黑角：旋转时生成对应掩码，标记有效区域（非黑角）
+    返回：(transformed_patch, patch_mask) — 旋转后的Patch + 有效区域掩码
     """
-    # Work on CHW tensor
-
     own_batch_dim = False
     if patch_tensor.dim() == 4 and patch_tensor.shape[0] == 1:
         p = patch_tensor[0]
@@ -198,45 +205,66 @@ def transform_single_patch(patch_tensor: torch.Tensor):
         raise ValueError("patch_tensor must be [1,3,H,W] or [3,H,W]")
 
     p = p.to(device=patch_tensor.device, dtype=patch_tensor.dtype)
-
-    # 1) random rotation (保留完整旋转区域)
-    angle = random.uniform(*TRANS_ROT_ANGLE)
     orig_h, orig_w = p.shape[-2], p.shape[-1]
-    p = TF.rotate(p, angle=angle, interpolation=InterpolationMode.BILINEAR, expand=True)
-    # resize回原尺寸以保证后续paste一致
-    p = interpolate(p.unsqueeze(0), size=(orig_h, orig_w), mode='bilinear', align_corners=False)[0]
 
-    # 2) brightness
+    # 1) 随机旋转 + 生成对应掩码（关键：用全1矩阵旋转得到掩码，标记有效区域）
+    angle = random.uniform(*TRANS_ROT_ANGLE)
+    # 旋转Patch（expand=True保留完整旋转区域，黑角为0）
+    p_rotated = TF.rotate(p, angle=angle, interpolation=InterpolationMode.BILINEAR, expand=True)
+    # 生成旋转掩码：用全1矩阵旋转，得到与Patch旋转后对应的掩码（1=有效区域，0=黑角）
+    mask_orig = torch.ones(1, orig_h, orig_w, device=p.device, dtype=p.dtype)
+    mask_rotated = TF.rotate(mask_orig, angle=angle, interpolation=InterpolationMode.BILINEAR, expand=True)
+    # 缩放Patch和掩码回原尺寸（保证后续粘贴尺寸一致）
+    p = interpolate(p_rotated.unsqueeze(0), size=(orig_h, orig_w), mode='bilinear', align_corners=False)[0]
+    mask = interpolate(mask_rotated.unsqueeze(0), size=(orig_h, orig_w), mode='bilinear', align_corners=False)[0]
+    # 掩码阈值处理：避免插值导致的非0/1值，确保只有有效区域为1
+    mask = (mask > 0.5).float()
+
+    # 2) 亮度调整（仅作用于Patch，不影响掩码）
     bright = random.uniform(*TRANS_BRIGHTNESS)
     p = TF.adjust_brightness(p, bright)
 
-    # 3) scale (保持canonical大小)
+    # 3) 缩放（Patch和掩码同步缩放，保证有效区域对应）
     scale = random.uniform(*TRANS_SCALE)
     new_h = max(1, int(round(orig_h * scale)))
     new_w = max(1, int(round(orig_w * scale)))
     if new_h != orig_h or new_w != orig_w:
+        # Patch缩放
         p = interpolate(p.unsqueeze(0), size=(new_h, new_w), mode='bilinear', align_corners=False)[0]
         p = interpolate(p.unsqueeze(0), size=(orig_h, orig_w), mode='bilinear', align_corners=False)[0]
+        # 掩码同步缩放（保证有效区域与Patch对应）
+        mask = interpolate(mask.unsqueeze(0), size=(new_h, new_w), mode='bilinear', align_corners=False)[0]
+        mask = interpolate(mask.unsqueeze(0), size=(orig_h, orig_w), mode='bilinear', align_corners=False)[0]
+        mask = (mask > 0.5).float()  # 再次阈值处理，确保掩码有效性
 
-    return p.unsqueeze(0) if own_batch_dim else p
+    # 恢复batch维度（如果输入有）
+    if own_batch_dim:
+        return p.unsqueeze(0), mask.unsqueeze(0)
+    else:
+        return p, mask
 
 
 def eot_transform_patch_once(patch_tensor: torch.Tensor):
     """
-    Wrapper to optionally do EoT averaging. Default paper-aligned behavior: single transform.
-    If USE_EOT True, do EOT_NUM_SAMPLES independent transforms and return the mean.
-    Returned tensor has same shape as input.
+    适配新增的掩码返回值：EoT时同步平均Patch和掩码
+    返回：(transformed_patch, patch_mask)
     """
     if not USE_EOT or EOT_NUM_SAMPLES <= 1:
         return transform_single_patch(patch_tensor)
     else:
-        # accumulate K transforms and average (keeps graph because transforms are differentiable)
-        transformed = []
+        patched_list = []
+        mask_list = []
         for _ in range(EOT_NUM_SAMPLES):
-            transformed.append(transform_single_patch(patch_tensor))
-        stacked = torch.stack(transformed, dim=0)  # [K, C, H, W] or [K,1,3,H,W]
-        mean = torch.mean(stacked, dim=0)
-        return mean
+            p, m = transform_single_patch(patch_tensor)
+            patched_list.append(p)
+            mask_list.append(m)
+        # 多采样平均（保留梯度）
+        stacked_p = torch.stack(patched_list, dim=0)
+        stacked_m = torch.stack(mask_list, dim=0)
+        mean_p = torch.mean(stacked_p, dim=0)
+        mean_m = torch.mean(stacked_m, dim=0)
+        mean_m = (mean_m > 0.5).float()  # 平均后重新阈值，确保掩码有效性
+        return mean_p, mean_m
 
 # -----------------------
 # Plotting helper (unchanged)
@@ -280,7 +308,7 @@ def plot_training_curves(step_history, loss_history, grad_norm_history, lr_histo
     logger.info(f"训练可视化图表已保存至: {save_path}")
 
 # -----------------------
-# Main
+# Main (仅修改Patch粘贴逻辑，传入掩码)
 # -----------------------
 def main():
     # dataloader
@@ -303,7 +331,6 @@ def main():
         num_enc_layers=6, num_dec_layers=6, p_base=0.2,
         sampling_strategy='categorical', device=DEVICE
     )
-    # START: register hooks once (we will temporarily remove during clean detection)
     tmm.register_hooks(model)
     tmm.reset_grad_history()
 
@@ -346,14 +373,13 @@ def main():
             B = imgs.shape[0]
 
             # 1. Clean detection on original images (disable TMM hooks temporarily)
-            #    -> This follows paper Fig.2: feed original image, get boxes, then add patch.
-            tmm.remove_hooks()   # temporarily remove mask hooks for clean detection
+            tmm.remove_hooks()
             with torch.no_grad():
                 try:
                     det_out = model(imgs)
                 except Exception:
                     det_out = model(NestedTensor(imgs))
-            tmm.register_hooks(model)  # re-enable for subsequent forward with patched images
+            tmm.register_hooks(model)
 
             # 2. Select boxes per image
             batch_boxes_all = []
@@ -390,8 +416,7 @@ def main():
                 sel_xyxy_nms = sel_xyxy[keep_nms]
                 batch_boxes_all.append(sel_xyxy_nms)
 
-            # 3. Build patched images: for each detection box, transform the patch (only patch),
-            #    resize transformed patch to computed side, and paste (original image unchanged).
+            # 3. Build patched images: 传入掩码粘贴，修复黑角
             patched = imgs.clone()
             patch_sizes = []
             for bi in range(B):
@@ -407,14 +432,19 @@ def main():
                     side = max(MIN_PATCH_PX, int(round(short * PATCH_RATIO)))
                     patch_sizes.append(side)
 
-                    # --- Only transform the patch (single random transform), keep original image unchanged ---
-                    transformed_patch = eot_transform_patch_once(patch)  # returns same shape as patch
-                    # Resize transformed patch to 'side'
+                    # 核心修改：获取变换后的Patch + 对应掩码（排除黑角）
+                    transformed_patch, patch_mask = eot_transform_patch_once(patch)
+                    # 同步缩放Patch和掩码到目标尺寸
                     patch_resized = interpolate(transformed_patch, size=(side, side),
                                                mode='bilinear', align_corners=False)
+                    mask_resized = interpolate(patch_mask, size=(side, side),
+                                             mode='bilinear', align_corners=False)
+                    mask_resized = (mask_resized > 0.5).float()  # 缩放后重新阈值
+
+                    # 传入掩码粘贴，仅保留有效区域（无黑角）
                     cx = (xmin + xmax) / 2.0
                     cy = (ymin + ymax) / 2.0
-                    patched[bi] = paste_patch_via_mask(patched[bi], patch_resized, (cx, cy))
+                    patched[bi] = paste_patch_via_mask(patched[bi], patch_resized, mask_resized, (cx, cy))
 
             # 4. loss & backward (only patch has requires_grad=True)
             loss_dict = loss_fn(imgs, patched, patch_tensor=patch)
@@ -466,7 +496,6 @@ def main():
                 patched_with_boxes = draw_boxes_on_tensor(detach_cpu(patched[0]), batch_boxes_all[0])
                 save_image(orig_with_boxes, os.path.join(SAVE_DIR, f"step_{global_step}_orig_with_boxes.png"))
                 save_image(patched_with_boxes, os.path.join(SAVE_DIR, f"step_{global_step}_patched_with_boxes.png"))
-                # Save the canonical patch (not the transformed one)
                 save_image(patch[0].detach().cpu(), os.path.join(SAVE_DIR, f"step_{global_step}_patch.png"))
             global_step += 1
 

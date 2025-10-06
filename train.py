@@ -1,5 +1,4 @@
-# /opt/data/private/BlackBox/train.py
-# 退回到train_t03.py，增加学习率调度器和训练曲线可视化
+# /opt/data/private/BlackBox/train.py train_05
 import os
 import math
 import random
@@ -13,14 +12,12 @@ from torchvision.ops import box_convert, nms
 from torch.nn.functional import interpolate
 import torchvision.transforms.functional as TF
 from torchvision.transforms import InterpolationMode
-# 导入学习率调度器模块
 import torch.optim.lr_scheduler as lr_scheduler
 
 from inria_dataloader import get_inria_dataloader
 from tmm import TransformerMaskingMatrix, load_detr_r50, NestedTensor
 from gse import GradientSelfEnsemble
 from loss import BlackBoxLoss
-
 
 # -----------------------
 # Config
@@ -33,14 +30,14 @@ VISUAL_DIR = os.path.join(ROOT, "save", "visual")
 os.makedirs(SAVE_DIR, exist_ok=True)
 os.makedirs(VISUAL_DIR, exist_ok=True)
 
-# matplotlib配置
+# matplotlib config (no-GUI)
 plt.switch_backend('Agg')
 plt.rcParams['font.sans-serif'] = ['DejaVu Sans']
 plt.rcParams['figure.figsize'] = (12, 8)
 plt.rcParams['axes.grid'] = True
 plt.rcParams['grid.alpha'] = 0.3
 
-# 日志配置
+# logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
@@ -51,22 +48,22 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# 训练参数（NUM_EPOCHS=100，50%衰减即第50个epoch）
+# training params
 BATCH_SIZE = 8
-NUM_EPOCHS = 100           
+NUM_EPOCHS = 4
 NUM_WORKERS = 4
 INIT_LR = 0.005
-DECAY_EPOCH = int(NUM_EPOCHS * 0.5)  # 第50个epoch后衰减
+DECAY_EPOCH = int(NUM_EPOCHS * 0.5)
 DECAY_FACTOR = 0.1
 
-# Patch参数
+# patch params
 PATCH_SIDE = 300
 PATCH_RATIO = 0.5
 PATCH_INIT_STD = 0.1
 MIN_PATCH_PX = 16
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# 模型检测参数
+# model / detection params
 MODEL_INPUT_H, MODEL_INPUT_W = 640, 640
 TARGET_CLASS_IDX = 1
 SCORE_THRESH = 0.5
@@ -75,15 +72,21 @@ FALLBACK_SCORE_THRESH = 0.2
 IOU_NMS_THRESH = 0.5
 MIN_BOX_SIDE = 5
 
-# 损失权重
+# loss weights
 DETECTION_WEIGHT = 1.0
 TV_WEIGHT = 1e-3
 NPS_WEIGHT = 0.0
 
-# 禁用EoT
-USE_EOT = False
+# EoT: PAPER-aligned default = single random transform.
+USE_EOT = False  # 默认 False：论文并未在公式上显式做多采样 EoT
+EOT_NUM_SAMPLES = 5  # 如果打开 EoT，可以设为>1
 
-# 可复现性
+# transformation ranges (per-paper / recommended)
+TRANS_ROT_ANGLE = (-5.0, 5.0)        # degrees
+TRANS_BRIGHTNESS = (0.9, 1.1)        # factor
+TRANS_SCALE = (0.9, 1.1)             # scale factor for patch before resize
+
+# reproducibility
 SEED = 42
 torch.manual_seed(SEED)
 np.random.seed(SEED)
@@ -91,7 +94,7 @@ random.seed(SEED)
 
 
 # -----------------------
-# Helpers（核心修改：增加dataloader参数）
+# Helpers
 # -----------------------
 def detach_cpu(img: torch.Tensor):
     return img.detach().cpu().clamp(0, 1)
@@ -121,10 +124,13 @@ def detr_boxes_to_xyxy_pixel(pred_boxes):
         pb[:, 3] = pb[:, 3] * MODEL_INPUT_H
     return box_convert(pb, in_fmt='cxcywh', out_fmt='xyxy').cpu()
 
-def eot_transform_patch(patch_tensor: torch.Tensor):
-    return patch_tensor
-
 def paste_patch_via_mask(base_img: torch.Tensor, patch_tensor: torch.Tensor, center_xy: tuple):
+    """
+    base_img: (3,H,W) tensor
+    patch_tensor: (1,3,ph,pw) or (3,ph,pw)
+    center_xy: (cx, cy) in pixel coords (float)
+    returns new image tensor with patch pasted (keeps grad).
+    """
     if patch_tensor.dim() == 4 and patch_tensor.shape[0] == 1:
         p = patch_tensor[0]
     elif patch_tensor.dim() == 3:
@@ -166,42 +172,100 @@ def paste_patch_via_mask(base_img: torch.Tensor, patch_tensor: torch.Tensor, cen
     padded_patch[:, dst_y0:dst_y1, dst_x0:dst_x1] = p_cropped
     return base_img * (1.0 - mask) + padded_patch * mask
 
-# 核心修改1：增加dataloader参数，用于计算decay_step
+# -----------------------
+# Patch Transformation (single-sample) — only operates on the patch tensor
+# -----------------------
+def transform_single_patch(patch_tensor: torch.Tensor):
+    """
+    Apply one random differentiable transform to the patch tensor:
+      - random rotation angle in TRANS_ROT_ANGLE (degrees)
+      - random brightness factor in TRANS_BRIGHTNESS
+      - random small scale factor in TRANS_SCALE (implemented via interpolate)
+    Input: patch_tensor: shape [1,3,H,W] or [3,H,W], torch.float (0..1)
+    Output: transformed patch with same shape and device, gradient preserved.
+    NOTE: This is a single-sample transform (paper-aligned). If USE_EOT True, multiple
+    transformed copies can be averaged externally.
+    """
+    # Work on CHW tensor
+
+    own_batch_dim = False
+    if patch_tensor.dim() == 4 and patch_tensor.shape[0] == 1:
+        p = patch_tensor[0]
+        own_batch_dim = True
+    elif patch_tensor.dim() == 3:
+        p = patch_tensor
+    else:
+        raise ValueError("patch_tensor must be [1,3,H,W] or [3,H,W]")
+
+    p = p.to(device=patch_tensor.device, dtype=patch_tensor.dtype)
+
+    # 1) random rotation (保留完整旋转区域)
+    angle = random.uniform(*TRANS_ROT_ANGLE)
+    orig_h, orig_w = p.shape[-2], p.shape[-1]
+    p = TF.rotate(p, angle=angle, interpolation=InterpolationMode.BILINEAR, expand=True)
+    # resize回原尺寸以保证后续paste一致
+    p = interpolate(p.unsqueeze(0), size=(orig_h, orig_w), mode='bilinear', align_corners=False)[0]
+
+    # 2) brightness
+    bright = random.uniform(*TRANS_BRIGHTNESS)
+    p = TF.adjust_brightness(p, bright)
+
+    # 3) scale (保持canonical大小)
+    scale = random.uniform(*TRANS_SCALE)
+    new_h = max(1, int(round(orig_h * scale)))
+    new_w = max(1, int(round(orig_w * scale)))
+    if new_h != orig_h or new_w != orig_w:
+        p = interpolate(p.unsqueeze(0), size=(new_h, new_w), mode='bilinear', align_corners=False)[0]
+        p = interpolate(p.unsqueeze(0), size=(orig_h, orig_w), mode='bilinear', align_corners=False)[0]
+
+    return p.unsqueeze(0) if own_batch_dim else p
+
+
+def eot_transform_patch_once(patch_tensor: torch.Tensor):
+    """
+    Wrapper to optionally do EoT averaging. Default paper-aligned behavior: single transform.
+    If USE_EOT True, do EOT_NUM_SAMPLES independent transforms and return the mean.
+    Returned tensor has same shape as input.
+    """
+    if not USE_EOT or EOT_NUM_SAMPLES <= 1:
+        return transform_single_patch(patch_tensor)
+    else:
+        # accumulate K transforms and average (keeps graph because transforms are differentiable)
+        transformed = []
+        for _ in range(EOT_NUM_SAMPLES):
+            transformed.append(transform_single_patch(patch_tensor))
+        stacked = torch.stack(transformed, dim=0)  # [K, C, H, W] or [K,1,3,H,W]
+        mean = torch.mean(stacked, dim=0)
+        return mean
+
+# -----------------------
+# Plotting helper (unchanged)
+# -----------------------
 def plot_training_curves(step_history, loss_history, grad_norm_history, lr_history, save_dir, dataloader):
-    """
-    绘制3类可视化图表：
-    1. 损失曲线（total_loss、det_loss、tv_loss）
-    2. 梯度范数曲线
-    3. 学习率变化曲线（含衰减点标记）
-    """
-    # 1. 损失曲线
     plt.subplot(3, 1, 1)
-    plt.plot(step_history, [l[0] for l in loss_history], label='Total Loss', color='#1f77b4', linewidth=2)
-    plt.plot(step_history, [l[1] for l in loss_history], label='Detection Loss', color='#ff7f0e', linewidth=2)
-    plt.plot(step_history, [l[2] for l in loss_history], label='TV Loss', color='#2ca02c', linewidth=2)
+    plt.plot(step_history, [l[0] for l in loss_history], label='Total Loss', linewidth=2)
+    plt.plot(step_history, [l[1] for l in loss_history], label='Detection Loss', linewidth=2)
+    plt.plot(step_history, [l[2] for l in loss_history], label='TV Loss', linewidth=2)
     plt.xlabel('Global Step')
     plt.ylabel('Loss Value')
     plt.title('Training Loss Curves')
     plt.legend()
     plt.tight_layout()
 
-    # 2. 梯度范数曲线（过滤None值）
     plt.subplot(3, 1, 2)
     valid_grad = [(s, g) for s, g in zip(step_history, grad_norm_history) if g is not None]
     if valid_grad:
         s_valid, g_valid = zip(*valid_grad)
-        plt.plot(s_valid, g_valid, color='#d62728', linewidth=2)
+        plt.plot(s_valid, g_valid, linewidth=2)
     plt.xlabel('Global Step')
     plt.ylabel('Gradient Norm')
     plt.title('Patch Gradient Norm Curve')
     plt.tight_layout()
 
-    # 3. 学习率变化曲线（标记衰减点）
     plt.subplot(3, 1, 3)
-    plt.plot(step_history, lr_history, color='#9467bd', linewidth=2)
-    # 标记学习率衰减点（使用传入的dataloader计算len）
+    plt.plot(step_history, lr_history, linewidth=2)
     if step_history and DECAY_EPOCH <= NUM_EPOCHS:
-        decay_step = DECAY_EPOCH * len(dataloader)  # 现在dataloader可正常访问
+        decay_step = DECAY_EPOCH * len(dataloader)
         if decay_step <= max(step_history):
             plt.axvline(x=decay_step, color='red', linestyle='--', alpha=0.7, label=f'Decay (epoch={DECAY_EPOCH})')
             plt.legend()
@@ -210,37 +274,40 @@ def plot_training_curves(step_history, loss_history, grad_norm_history, lr_histo
     plt.title('Learning Rate Schedule (BlackBox Paper)')
     plt.tight_layout()
 
-    # 保存图表
     save_path = os.path.join(save_dir, 'training_visualization.png')
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
     plt.close()
     logger.info(f"训练可视化图表已保存至: {save_path}")
 
-
+# -----------------------
+# Main
+# -----------------------
 def main():
-    # 数据加载
+    # dataloader
     dataloader = get_inria_dataloader(
         DATA_ROOT, split="Train", batch_size=BATCH_SIZE,
         num_workers=NUM_WORKERS, disable_random_aug=True
     )
     logger.info(f"训练数据集大小: {len(dataloader.dataset)}")
     logger.info(f"学习率策略：初始LR={INIT_LR}，第{DECAY_EPOCH}个epoch后衰减至{INIT_LR*DECAY_FACTOR}（BlackBox论文）")
+    logger.info(f"Patch transforms: rotate{TRANS_ROT_ANGLE} brightness{TRANS_BRIGHTNESS} scale{TRANS_SCALE} USE_EOT={USE_EOT}")
 
-    # 模型初始化
+    # model
     model = load_detr_r50().to(DEVICE)
     model.eval()
     for p in model.parameters():
         p.requires_grad = False
 
-    # TMM初始化
+    # TMM
     tmm = TransformerMaskingMatrix(
         num_enc_layers=6, num_dec_layers=6, p_base=0.2,
         sampling_strategy='categorical', device=DEVICE
     )
+    # START: register hooks once (we will temporarily remove during clean detection)
     tmm.register_hooks(model)
     tmm.reset_grad_history()
 
-    # GSE和损失函数
+    # GSE + loss
     gse = GradientSelfEnsemble(model=model, device=DEVICE)
     loss_fn = BlackBoxLoss(
         gse=gse, target_class=TARGET_CLASS_IDX,
@@ -249,27 +316,26 @@ def main():
         device=DEVICE
     )
 
-    # 初始化Patch
+    # patch init
     patch = torch.randn(1, 3, PATCH_SIDE, PATCH_SIDE, device=DEVICE) * PATCH_INIT_STD + 0.5
     patch = patch.clamp(0.0, 1.0)
     patch.requires_grad_(True)
 
-    # 优化器与调度器（符合论文一次衰减）
+    # optimizer / scheduler
     optimizer = torch.optim.Adam([patch], lr=INIT_LR)
     scheduler = lr_scheduler.LambdaLR(
         optimizer,
         lr_lambda=lambda epoch: DECAY_FACTOR if epoch >= DECAY_EPOCH else 1.0
     )
 
-    # 可视化记录列表
+    # logging lists
     step_history = []
     loss_history = []
     grad_norm_history = []
     lr_history = []
 
-    logger.info(f"开始训练（EoT已禁用，PATCH_RATIO={PATCH_RATIO}），结果保存至: {SAVE_DIR}")
+    logger.info(f"开始训练（PATCH_RATIO={PATCH_RATIO}），结果保存至: {SAVE_DIR}")
 
-    # 训练循环
     global_step = 0
     for epoch in range(NUM_EPOCHS):
         model.eval()
@@ -279,16 +345,17 @@ def main():
             imgs = imgs.to(DEVICE).clamp(0, 1)
             B = imgs.shape[0]
 
-            # 1. 检测干净图像目标框
-            tmm.remove_hooks()
+            # 1. Clean detection on original images (disable TMM hooks temporarily)
+            #    -> This follows paper Fig.2: feed original image, get boxes, then add patch.
+            tmm.remove_hooks()   # temporarily remove mask hooks for clean detection
             with torch.no_grad():
                 try:
                     det_out = model(imgs)
                 except Exception:
                     det_out = model(NestedTensor(imgs))
-            tmm.register_hooks(model)
+            tmm.register_hooks(model)  # re-enable for subsequent forward with patched images
 
-            # 2. 筛选目标框
+            # 2. Select boxes per image
             batch_boxes_all = []
             for bi in range(B):
                 logits = det_out['pred_logits'][bi]
@@ -323,7 +390,8 @@ def main():
                 sel_xyxy_nms = sel_xyxy[keep_nms]
                 batch_boxes_all.append(sel_xyxy_nms)
 
-            # 3. 生成带Patch的图像
+            # 3. Build patched images: for each detection box, transform the patch (only patch),
+            #    resize transformed patch to computed side, and paste (original image unchanged).
             patched = imgs.clone()
             patch_sizes = []
             for bi in range(B):
@@ -339,14 +407,16 @@ def main():
                     side = max(MIN_PATCH_PX, int(round(short * PATCH_RATIO)))
                     patch_sizes.append(side)
 
-                    patch_to_paste = patch
-                    patch_resized = interpolate(patch_to_paste, size=(side, side),
+                    # --- Only transform the patch (single random transform), keep original image unchanged ---
+                    transformed_patch = eot_transform_patch_once(patch)  # returns same shape as patch
+                    # Resize transformed patch to 'side'
+                    patch_resized = interpolate(transformed_patch, size=(side, side),
                                                mode='bilinear', align_corners=False)
                     cx = (xmin + xmax) / 2.0
                     cy = (ymin + ymax) / 2.0
                     patched[bi] = paste_patch_via_mask(patched[bi], patch_resized, (cx, cy))
 
-            # 4. 计算损失并更新Patch
+            # 4. loss & backward (only patch has requires_grad=True)
             loss_dict = loss_fn(imgs, patched, patch_tensor=patch)
             total_loss = loss_dict['total_loss']
             optimizer.zero_grad()
@@ -360,7 +430,7 @@ def main():
             with torch.no_grad():
                 patch.clamp_(0.0, 1.0)
 
-            # 5. 记录可视化数据
+            # 5. logging & visualization bookkeeping
             if batch_idx % 10 == 0:
                 det_loss_v = loss_dict.get('det_loss', 0.0)
                 det_loss_v = det_loss_v.item() if isinstance(det_loss_v, torch.Tensor) else float(det_loss_v)
@@ -373,7 +443,7 @@ def main():
                 grad_norm_history.append(grad_norm)
                 lr_history.append(current_lr)
 
-            # 6. 日志记录
+            # 6. info log
             det_loss_v = loss_dict.get('det_loss', 0.0)
             det_loss_v = det_loss_v.item() if isinstance(det_loss_v, torch.Tensor) else float(det_loss_v)
             tv_loss_v = loss_dict.get('tv_loss', 0.0)
@@ -384,45 +454,41 @@ def main():
                 f"total_loss={total_loss.item():.6f} | "
                 f"det_loss={det_loss_v:.6f} | "
                 f"tv_loss={tv_loss_v:.6f} | "
-                f"grad_norm={grad_norm:.4f} | "
+                f"grad_norm={(grad_norm if grad_norm is not None else float('nan')):.4f} | "
                 f"目标框数量={[b.shape[0] for b in batch_boxes_all]} | "
                 f"平均Patch尺寸={avg_patch_side:.1f} | "
                 f"当前学习率={optimizer.param_groups[0]['lr']:.6f}"
             )
 
-            # 7. 保存样本可视化
+            # 7. save visual examples occasionally
             if global_step % 200 == 0:
                 orig_with_boxes = draw_boxes_on_tensor(detach_cpu(imgs[0]), batch_boxes_all[0])
                 patched_with_boxes = draw_boxes_on_tensor(detach_cpu(patched[0]), batch_boxes_all[0])
                 save_image(orig_with_boxes, os.path.join(SAVE_DIR, f"step_{global_step}_orig_with_boxes.png"))
                 save_image(patched_with_boxes, os.path.join(SAVE_DIR, f"step_{global_step}_patched_with_boxes.png"))
+                # Save the canonical patch (not the transformed one)
                 save_image(patch[0].detach().cpu(), os.path.join(SAVE_DIR, f"step_{global_step}_patch.png"))
             global_step += 1
 
-        # 更新学习率调度器
+        # epoch end: scheduler step, plotting, save snapshot
         scheduler.step()
-
-        # 核心修改2：调用可视化函数时传入dataloader
         if step_history and loss_history:
             plot_training_curves(step_history, loss_history, grad_norm_history, lr_history, VISUAL_DIR, dataloader)
 
-        # 保存epoch Patch
         save_image(patch[0].detach().cpu(), os.path.join(SAVE_DIR, f"epoch_{epoch+1}_patch.png"))
         torch.save(patch[0].detach().cpu(), os.path.join(SAVE_DIR, f"epoch_{epoch+1}_patch.pt"))
         logger.info(
-            f"Epoch {epoch+1} 保存Patch快照 | "
-            f"当前学习率={optimizer.param_groups[0]['lr']:.6f} | "
+            f"Epoch {epoch+1} 保存Patch快照 | 当前学习率={optimizer.param_groups[0]['lr']:.6f} | "
             f"距离学习率衰减剩余epoch: {max(0, DECAY_EPOCH - epoch)}"
         )
 
-    # 训练结束：最终可视化
+    # final: plotting & cleanup
     if step_history and loss_history:
         plot_training_curves(step_history, loss_history, grad_norm_history, lr_history, VISUAL_DIR, dataloader)
     tmm.remove_hooks()
     save_image(patch[0].detach().cpu(), os.path.join(SAVE_DIR, "final_patch.png"))
     torch.save(patch[0].detach().cpu(), os.path.join(SAVE_DIR, "final_patch.pt"))
     logger.info(f"训练完成！最终Patch保存至: {SAVE_DIR} | 最终学习率={optimizer.param_groups[0]['lr']:.6f}")
-
 
 if __name__ == "__main__":
     main()

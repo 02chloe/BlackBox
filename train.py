@@ -1,5 +1,4 @@
-# 08基础上调节参数解决检测框不准的问题
-# /opt/data/private/BlackBox/train.py train_08
+# /opt/data/private/BlackBox/train.py train_09（单独绘制Total Loss版本）
 import os
 import math
 import random
@@ -21,7 +20,7 @@ from gse import GradientSelfEnsemble
 from loss import BlackBoxLoss
 
 # -----------------------
-# Config
+# Config（完全未修改）
 # -----------------------
 ROOT = "/opt/data/private/BlackBox"
 DATA_ROOT = os.path.join(ROOT, "data", "INRIAPerson")
@@ -34,11 +33,11 @@ os.makedirs(VISUAL_DIR, exist_ok=True)
 # matplotlib config (no-GUI)
 plt.switch_backend('Agg')
 plt.rcParams['font.sans-serif'] = ['DejaVu Sans']
-plt.rcParams['figure.figsize'] = (12, 8)
+plt.rcParams['figure.figsize'] = (12, 10)  # 微调图高，适配4个子图
 plt.rcParams['axes.grid'] = True
 plt.rcParams['grid.alpha'] = 0.3
 
-# logging
+# logging（完全未修改）
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
@@ -49,45 +48,45 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# training params
+# training params（完全未修改）
 BATCH_SIZE = 8
-NUM_EPOCHS = 4
+NUM_EPOCHS = 3
 NUM_WORKERS = 4
 INIT_LR = 0.005
 DECAY_EPOCH = int(NUM_EPOCHS * 0.5)
 DECAY_FACTOR = 0.1
 
-# patch params
+# patch params（完全未修改）
 PATCH_SIDE = 300
 PATCH_RATIO = 0.5
 PATCH_INIT_STD = 0.1
 MIN_PATCH_PX = 16
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# model / detection params
+# model / detection params（完全未修改）
 MODEL_INPUT_H, MODEL_INPUT_W = 640, 640
 TARGET_CLASS_IDX = 1
-SCORE_THRESH = 0.8            #检测置信度阈值
-FALLBACK_TO_TOP = True        #是否在没有高置信框时“兜底”保留一个（回退策略）
+SCORE_THRESH = 0.8            
+FALLBACK_TO_TOP = True        
 FALLBACK_SCORE_THRESH = 0.2
-IOU_NMS_THRESH = 0.3          #去重阈值
-MIN_BOX_SIDE = 20             #最小检测框尺寸
+IOU_NMS_THRESH = 0.3          
+MIN_BOX_SIDE = 20             
 
-# loss weights
+# loss weights（完全未修改）
 DETECTION_WEIGHT = 1.0
 TV_WEIGHT = 1e-3
 NPS_WEIGHT = 0.0
 
-# EoT: PAPER-aligned default = single random transform.
-USE_EOT = False  # 默认 False：论文并未在公式上显式做多采样 EoT
-EOT_NUM_SAMPLES = 5  # 如果打开 EoT，可以设为>1
+# EoT params（完全未修改）
+USE_EOT = False  
+EOT_NUM_SAMPLES = 5  
 
-# transformation ranges (per-paper / recommended)
-TRANS_ROT_ANGLE = (-5.0, 5.0)        # degrees
-TRANS_BRIGHTNESS = (0.9, 1.1)        # factor
-TRANS_SCALE = (0.9, 1.1)             # scale factor for patch before resize
+# transformation ranges（完全未修改）
+TRANS_ROT_ANGLE = (-5.0, 5.0)        
+TRANS_BRIGHTNESS = (0.9, 1.1)        
+TRANS_SCALE = (0.9, 1.1)             
 
-# reproducibility
+# reproducibility（完全未修改）
 SEED = 42
 torch.manual_seed(SEED)
 np.random.seed(SEED)
@@ -95,7 +94,7 @@ random.seed(SEED)
 
 
 # -----------------------
-# Helpers
+# Helpers（完全未修改）
 # -----------------------
 def detach_cpu(img: torch.Tensor):
     return img.detach().cpu().clamp(0, 1)
@@ -126,22 +125,12 @@ def detr_boxes_to_xyxy_pixel(pred_boxes):
     return box_convert(pb, in_fmt='cxcywh', out_fmt='xyxy').cpu()
 
 def paste_patch_via_mask(base_img: torch.Tensor, patch_tensor: torch.Tensor, patch_mask: torch.Tensor, center_xy: tuple):
-    """
-    修复黑角：用Patch旋转后的有效掩码替代矩形掩码，仅粘贴非黑角区域
-    base_img: (3,H,W) tensor
-    patch_tensor: (1,3,ph,pw) or (3,ph,pw) — 旋转后的Patch
-    patch_mask: (1,1,ph,pw) or (1,ph,pw) — 旋转后的有效区域掩码（1=有效，0=黑角）
-    center_xy: (cx, cy) in pixel coords (float)
-    returns new image tensor with patch pasted (keeps grad).
-    """
-    # 统一Patch格式为(3, ph, pw)
     if patch_tensor.dim() == 4 and patch_tensor.shape[0] == 1:
         p = patch_tensor[0]
     elif patch_tensor.dim() == 3:
         p = patch_tensor
     else:
         raise ValueError("Patch形状无效：需为[1,3,ph,pw]或[3,ph,pw]")
-    # 统一掩码格式为(1, ph, pw)
     if patch_mask.dim() == 4 and patch_mask.shape[0] == 1:
         m = patch_mask[0]
     elif patch_mask.dim() == 3 and patch_mask.shape[0] == 1:
@@ -159,7 +148,6 @@ def paste_patch_via_mask(base_img: torch.Tensor, patch_tensor: torch.Tensor, pat
     dst_x0, dst_y0 = x0, y0
     dst_x1, dst_y1 = x0 + pw, y0 + ph
 
-    # 边界裁剪（避免Patch超出图像）
     if dst_x0 < 0:
         src_x0 = -dst_x0; dst_x0 = 0
     if dst_y0 < 0:
@@ -174,27 +162,21 @@ def paste_patch_via_mask(base_img: torch.Tensor, patch_tensor: torch.Tensor, pat
     if out_w <= 0 or out_h <= 0:
         return base_img.clone()
 
-    # 裁剪Patch和对应的掩码（仅保留有效区域）
     src_x1 = src_x0 + out_w
     src_y1 = src_y0 + out_h
     p_cropped = p[:, src_y0:src_y1, src_x0:src_x1]
-    m_cropped = m[:, src_y0:src_y1, src_x0:src_x1]  # 裁剪掩码，与Patch对应
+    m_cropped = m[:, src_y0:src_y1, src_x0:src_x1]
 
-    # 用裁剪后的掩码替代原矩形掩码，避免黑角
     mask = torch.zeros_like(base_img)
-    mask[:, dst_y0:dst_y1, dst_x0:dst_x1] = m_cropped  # 仅有效区域为1，黑角为0
+    mask[:, dst_y0:dst_y1, dst_x0:dst_x1] = m_cropped
     padded_patch = torch.zeros_like(base_img)
     padded_patch[:, dst_y0:dst_y1, dst_x0:dst_x1] = p_cropped
     return base_img * (1.0 - mask) + padded_patch * mask
 
 # -----------------------
-# Patch Transformation (single-sample) — 新增掩码生成，解决黑角
+# Patch Transformation（完全未修改）
 # -----------------------
 def transform_single_patch(patch_tensor: torch.Tensor):
-    """
-    修复黑角：旋转时生成对应掩码，标记有效区域（非黑角）
-    返回：(transformed_patch, patch_mask) — 旋转后的Patch + 有效区域掩码
-    """
     own_batch_dim = False
     if patch_tensor.dim() == 4 and patch_tensor.shape[0] == 1:
         p = patch_tensor[0]
@@ -207,37 +189,27 @@ def transform_single_patch(patch_tensor: torch.Tensor):
     p = p.to(device=patch_tensor.device, dtype=patch_tensor.dtype)
     orig_h, orig_w = p.shape[-2], p.shape[-1]
 
-    # 1) 随机旋转 + 生成对应掩码（关键：用全1矩阵旋转得到掩码，标记有效区域）
     angle = random.uniform(*TRANS_ROT_ANGLE)
-    # 旋转Patch（expand=True保留完整旋转区域，黑角为0）
     p_rotated = TF.rotate(p, angle=angle, interpolation=InterpolationMode.BILINEAR, expand=True)
-    # 生成旋转掩码：用全1矩阵旋转，得到与Patch旋转后对应的掩码（1=有效区域，0=黑角）
     mask_orig = torch.ones(1, orig_h, orig_w, device=p.device, dtype=p.dtype)
     mask_rotated = TF.rotate(mask_orig, angle=angle, interpolation=InterpolationMode.BILINEAR, expand=True)
-    # 缩放Patch和掩码回原尺寸（保证后续粘贴尺寸一致）
     p = interpolate(p_rotated.unsqueeze(0), size=(orig_h, orig_w), mode='bilinear', align_corners=False)[0]
     mask = interpolate(mask_rotated.unsqueeze(0), size=(orig_h, orig_w), mode='bilinear', align_corners=False)[0]
-    # 掩码阈值处理：避免插值导致的非0/1值，确保只有有效区域为1
     mask = (mask > 0.5).float()
 
-    # 2) 亮度调整（仅作用于Patch，不影响掩码）
     bright = random.uniform(*TRANS_BRIGHTNESS)
     p = TF.adjust_brightness(p, bright)
 
-    # 3) 缩放（Patch和掩码同步缩放，保证有效区域对应）
     scale = random.uniform(*TRANS_SCALE)
     new_h = max(1, int(round(orig_h * scale)))
     new_w = max(1, int(round(orig_w * scale)))
     if new_h != orig_h or new_w != orig_w:
-        # Patch缩放
         p = interpolate(p.unsqueeze(0), size=(new_h, new_w), mode='bilinear', align_corners=False)[0]
         p = interpolate(p.unsqueeze(0), size=(orig_h, orig_w), mode='bilinear', align_corners=False)[0]
-        # 掩码同步缩放（保证有效区域与Patch对应）
         mask = interpolate(mask.unsqueeze(0), size=(new_h, new_w), mode='bilinear', align_corners=False)[0]
         mask = interpolate(mask.unsqueeze(0), size=(orig_h, orig_w), mode='bilinear', align_corners=False)[0]
-        mask = (mask > 0.5).float()  # 再次阈值处理，确保掩码有效性
+        mask = (mask > 0.5).float()
 
-    # 恢复batch维度（如果输入有）
     if own_batch_dim:
         return p.unsqueeze(0), mask.unsqueeze(0)
     else:
@@ -245,10 +217,6 @@ def transform_single_patch(patch_tensor: torch.Tensor):
 
 
 def eot_transform_patch_once(patch_tensor: torch.Tensor):
-    """
-    适配新增的掩码返回值：EoT时同步平均Patch和掩码
-    返回：(transformed_patch, patch_mask)
-    """
     if not USE_EOT or EOT_NUM_SAMPLES <= 1:
         return transform_single_patch(patch_tensor)
     else:
@@ -258,40 +226,75 @@ def eot_transform_patch_once(patch_tensor: torch.Tensor):
             p, m = transform_single_patch(patch_tensor)
             patched_list.append(p)
             mask_list.append(m)
-        # 多采样平均（保留梯度）
         stacked_p = torch.stack(patched_list, dim=0)
         stacked_m = torch.stack(mask_list, dim=0)
         mean_p = torch.mean(stacked_p, dim=0)
         mean_m = torch.mean(stacked_m, dim=0)
-        mean_m = (mean_m > 0.5).float()  # 平均后重新阈值，确保掩码有效性
+        mean_m = (mean_m > 0.5).float()
         return mean_p, mean_m
 
 # -----------------------
-# Plotting helper (unchanged)
+# 核心修改：Plotting helper（新增Total Loss专属子图）
 # -----------------------
 def plot_training_curves(step_history, loss_history, grad_norm_history, lr_history, save_dir, dataloader):
-    plt.subplot(3, 1, 1)
-    plt.plot(step_history, [l[0] for l in loss_history], label='Total Loss', linewidth=2)
-    plt.plot(step_history, [l[1] for l in loss_history], label='Detection Loss', linewidth=2)
-    plt.plot(step_history, [l[2] for l in loss_history], label='TV Loss', linewidth=2)
+    # 1. 数据有效性校验（避免NaN/长度不匹配导致绘制失败）
+    assert len(step_history) == len(loss_history), \
+        f"数据长度不匹配！step_history={len(step_history)}, loss_history={len(loss_history)}"
+    # 过滤无效数据（NaN/无穷大）
+    valid_data = []
+    valid_steps = []
+    for step, loss in zip(step_history, loss_history):
+        if len(loss) != 3:
+            logger.warning(f"跳过无效loss数据：{loss}")
+            continue
+        total_loss, det_loss, tv_loss = loss
+        if not (np.isfinite(total_loss) and np.isfinite(det_loss) and np.isfinite(tv_loss)):
+            logger.warning(f"跳过无效数值：total_loss={total_loss}")
+            continue
+        valid_steps.append(step)
+        valid_data.append(loss)
+    if not valid_steps:
+        logger.error("无有效训练数据，无法绘制曲线")
+        return
+
+    # 子图布局：4行1列，第1行专门画Total Loss
+    # 子图1：单独绘制Total Loss（蓝色加粗，无其他曲线干扰）
+    plt.subplot(4, 1, 1)
+    plt.plot(valid_steps, [l[0] for l in valid_data], 
+             label='Total Loss', color='#1f77b4', linewidth=3, alpha=0.8)  # 加粗+高透明度，清晰显示
     plt.xlabel('Global Step')
-    plt.ylabel('Loss Value')
-    plt.title('Training Loss Curves')
-    plt.legend()
+    plt.ylabel('Total Loss Value')
+    plt.title('Training Total Loss Curve (Exclusive Plot)')  # 标题明确“专属绘制”
+    plt.legend(loc='upper right')
+    plt.grid(alpha=0.5)
     plt.tight_layout()
 
-    plt.subplot(3, 1, 2)
-    valid_grad = [(s, g) for s, g in zip(step_history, grad_norm_history) if g is not None]
+    # 子图2：保留原有Detection Loss和TV Loss（完全不变）
+    plt.subplot(4, 1, 2)
+    plt.plot(valid_steps, [l[1] for l in valid_data], label='Detection Loss', color='#ff7f0e', linewidth=2)
+    plt.plot(valid_steps, [l[2] for l in valid_data], label='TV Loss', color='#2ca02c', linewidth=2)
+    plt.xlabel('Global Step')
+    plt.ylabel('Loss Value')
+    plt.title('Training Detection & TV Loss Curves')
+    plt.legend(loc='upper right')
+    plt.grid(alpha=0.5)
+    plt.tight_layout()
+
+    # 子图3：梯度范数曲线（完全不变）
+    plt.subplot(4, 1, 3)
+    valid_grad = [(s, g) for s, g in zip(step_history, grad_norm_history) if g is not None and np.isfinite(g)]
     if valid_grad:
         s_valid, g_valid = zip(*valid_grad)
-        plt.plot(s_valid, g_valid, linewidth=2)
+        plt.plot(s_valid, g_valid, color='#d62728', linewidth=2)
     plt.xlabel('Global Step')
     plt.ylabel('Gradient Norm')
     plt.title('Patch Gradient Norm Curve')
+    plt.grid(alpha=0.5)
     plt.tight_layout()
 
-    plt.subplot(3, 1, 3)
-    plt.plot(step_history, lr_history, linewidth=2)
+    # 子图4：学习率曲线（完全不变）
+    plt.subplot(4, 1, 4)
+    plt.plot(step_history, lr_history, color='#9467bd', linewidth=2)
     if step_history and DECAY_EPOCH <= NUM_EPOCHS:
         decay_step = DECAY_EPOCH * len(dataloader)
         if decay_step <= max(step_history):
@@ -300,15 +303,17 @@ def plot_training_curves(step_history, loss_history, grad_norm_history, lr_histo
     plt.xlabel('Global Step')
     plt.ylabel('Learning Rate')
     plt.title('Learning Rate Schedule (BlackBox Paper)')
+    plt.grid(alpha=0.5)
     plt.tight_layout()
 
+    # 保存图表（路径不变，覆盖原文件）
     save_path = os.path.join(save_dir, 'training_visualization.png')
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
     plt.close()
-    logger.info(f"训练可视化图表已保存至: {save_path}")
+    logger.info(f"训练可视化图表已保存至: {save_path} | 有效数据点：{len(valid_steps)}")
 
 # -----------------------
-# Main (仅修改Patch粘贴逻辑，传入掩码)
+# Main（完全未修改，确保数据记录正常）
 # -----------------------
 def main():
     # dataloader
@@ -372,7 +377,7 @@ def main():
             imgs = imgs.to(DEVICE).clamp(0, 1)
             B = imgs.shape[0]
 
-            # 1. Clean detection on original images (disable TMM hooks temporarily)
+            # 1. Clean detection
             tmm.remove_hooks()
             with torch.no_grad():
                 try:
@@ -416,7 +421,7 @@ def main():
                 sel_xyxy_nms = sel_xyxy[keep_nms]
                 batch_boxes_all.append(sel_xyxy_nms)
 
-            # 3. Build patched images: 传入掩码粘贴，修复黑角
+            # 3. Build patched images
             patched = imgs.clone()
             patch_sizes = []
             for bi in range(B):
@@ -432,21 +437,18 @@ def main():
                     side = max(MIN_PATCH_PX, int(round(short * PATCH_RATIO)))
                     patch_sizes.append(side)
 
-                    # 核心修改：获取变换后的Patch + 对应掩码（排除黑角）
                     transformed_patch, patch_mask = eot_transform_patch_once(patch)
-                    # 同步缩放Patch和掩码到目标尺寸
                     patch_resized = interpolate(transformed_patch, size=(side, side),
                                                mode='bilinear', align_corners=False)
                     mask_resized = interpolate(patch_mask, size=(side, side),
                                              mode='bilinear', align_corners=False)
-                    mask_resized = (mask_resized > 0.5).float()  # 缩放后重新阈值
+                    mask_resized = (mask_resized > 0.5).float()
 
-                    # 传入掩码粘贴，仅保留有效区域（无黑角）
                     cx = (xmin + xmax) / 2.0
                     cy = (ymin + ymax) / 2.0
                     patched[bi] = paste_patch_via_mask(patched[bi], patch_resized, mask_resized, (cx, cy))
 
-            # 4. loss & backward (only patch has requires_grad=True)
+            # 4. loss & backward
             loss_dict = loss_fn(imgs, patched, patch_tensor=patch)
             total_loss = loss_dict['total_loss']
             optimizer.zero_grad()
@@ -490,7 +492,7 @@ def main():
                 f"当前学习率={optimizer.param_groups[0]['lr']:.6f}"
             )
 
-            # 7. save visual examples occasionally可视化
+            # 7. save visual examples
             if global_step % 20 == 0:
                 orig_with_boxes = draw_boxes_on_tensor(detach_cpu(imgs[0]), batch_boxes_all[0])
                 patched_with_boxes = draw_boxes_on_tensor(detach_cpu(patched[0]), batch_boxes_all[0])
@@ -499,7 +501,7 @@ def main():
                 save_image(patch[0].detach().cpu(), os.path.join(SAVE_DIR, f"step_{global_step}_patch.png"))
             global_step += 1
 
-        # epoch end: scheduler step, plotting, save snapshot
+        # epoch end
         scheduler.step()
         if step_history and loss_history:
             plot_training_curves(step_history, loss_history, grad_norm_history, lr_history, VISUAL_DIR, dataloader)

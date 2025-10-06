@@ -1,4 +1,4 @@
-# 05基础上修复patch旋转黑角问题
+# 08基础上调节参数解决检测框不准的问题
 # /opt/data/private/BlackBox/train.py train_08
 import os
 import math
@@ -67,11 +67,11 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # model / detection params
 MODEL_INPUT_H, MODEL_INPUT_W = 640, 640
 TARGET_CLASS_IDX = 1
-SCORE_THRESH = 0.5
-FALLBACK_TO_TOP = True
+SCORE_THRESH = 0.8            #检测置信度阈值
+FALLBACK_TO_TOP = True        #是否在没有高置信框时“兜底”保留一个（回退策略）
 FALLBACK_SCORE_THRESH = 0.2
-IOU_NMS_THRESH = 0.5
-MIN_BOX_SIDE = 5
+IOU_NMS_THRESH = 0.3          #去重阈值
+MIN_BOX_SIDE = 20             #最小检测框尺寸
 
 # loss weights
 DETECTION_WEIGHT = 1.0
@@ -490,8 +490,8 @@ def main():
                 f"当前学习率={optimizer.param_groups[0]['lr']:.6f}"
             )
 
-            # 7. save visual examples occasionally
-            if global_step % 200 == 0:
+            # 7. save visual examples occasionally可视化
+            if global_step % 20 == 0:
                 orig_with_boxes = draw_boxes_on_tensor(detach_cpu(imgs[0]), batch_boxes_all[0])
                 patched_with_boxes = draw_boxes_on_tensor(detach_cpu(patched[0]), batch_boxes_all[0])
                 save_image(orig_with_boxes, os.path.join(SAVE_DIR, f"step_{global_step}_orig_with_boxes.png"))

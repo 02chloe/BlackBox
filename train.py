@@ -1,4 +1,8 @@
-# /opt/data/private/BlackBox/train.py train_09（单独绘制Total Loss版本）
+# /opt/data/private/BlackBox/train.py train_t10.py，配合模块化修改调用函数（模型加载模块化）
+# 核心修改：从utils导入模型加载函数（替代从tmm导入）
+# 单独保存final patch
+# from utils import load_detr_r50
+
 import os
 import math
 import random
@@ -15,19 +19,23 @@ from torchvision.transforms import InterpolationMode
 import torch.optim.lr_scheduler as lr_scheduler
 
 from inria_dataloader import get_inria_dataloader
-from tmm import TransformerMaskingMatrix, load_detr_r50, NestedTensor
+# 核心修改：从utils导入模型加载函数（替代从tmm导入）
+from utils.load_model import load_detr_r50
+from tmm import TransformerMaskingMatrix, NestedTensor  # 仅保留TMM和NestedTensor
 from gse import GradientSelfEnsemble
 from loss import BlackBoxLoss
 
 # -----------------------
-# Config（完全未修改）
+# Config（修改：添加FINAL_PATCH_DIR）
 # -----------------------
 ROOT = "/opt/data/private/BlackBox"
 DATA_ROOT = os.path.join(ROOT, "data", "INRIAPerson")
 SAVE_DIR = os.path.join(ROOT, "save", "demo")
+FINAL_PATCH_DIR = os.path.join(ROOT, "save", "final_patch")  # 新增：final patch专用目录
 LOG_PATH = os.path.join(ROOT, "save", "train.log")
 VISUAL_DIR = os.path.join(ROOT, "save", "visual")
 os.makedirs(SAVE_DIR, exist_ok=True)
+os.makedirs(FINAL_PATCH_DIR, exist_ok=True)  # 新增：创建final patch目录
 os.makedirs(VISUAL_DIR, exist_ok=True)
 
 # matplotlib config (no-GUI)
@@ -50,7 +58,7 @@ logger = logging.getLogger(__name__)
 
 # training params（完全未修改）
 BATCH_SIZE = 8
-NUM_EPOCHS = 3
+NUM_EPOCHS = 100
 NUM_WORKERS = 4
 INIT_LR = 0.005
 DECAY_EPOCH = int(NUM_EPOCHS * 0.5)
@@ -264,7 +272,7 @@ def plot_training_curves(step_history, loss_history, grad_norm_history, lr_histo
              label='Total Loss', color='#1f77b4', linewidth=3, alpha=0.8)  # 加粗+高透明度，清晰显示
     plt.xlabel('Global Step')
     plt.ylabel('Total Loss Value')
-    plt.title('Training Total Loss Curve (Exclusive Plot)')  # 标题明确“专属绘制”
+    plt.title('Training Total Loss Curve (Exclusive Plot)')  # 标题明确"专属绘制"
     plt.legend(loc='upper right')
     plt.grid(alpha=0.5)
     plt.tight_layout()
@@ -312,11 +320,8 @@ def plot_training_curves(step_history, loss_history, grad_norm_history, lr_histo
     plt.close()
     logger.info(f"训练可视化图表已保存至: {save_path} | 有效数据点：{len(valid_steps)}")
 
-# -----------------------
-# Main（完全未修改，确保数据记录正常）
-# -----------------------
 def main():
-    # dataloader
+    # dataloader（不变）
     dataloader = get_inria_dataloader(
         DATA_ROOT, split="Train", batch_size=BATCH_SIZE,
         num_workers=NUM_WORKERS, disable_random_aug=True
@@ -325,11 +330,12 @@ def main():
     logger.info(f"学习率策略：初始LR={INIT_LR}，第{DECAY_EPOCH}个epoch后衰减至{INIT_LR*DECAY_FACTOR}（BlackBox论文）")
     logger.info(f"Patch transforms: rotate{TRANS_ROT_ANGLE} brightness{TRANS_BRIGHTNESS} scale{TRANS_SCALE} USE_EOT={USE_EOT}")
 
-    # model
-    model = load_detr_r50().to(DEVICE)
+    # model（不变，模型加载函数来源改变，但功能一致）
+    model = load_detr_r50(device=DEVICE)  # 调用utils的load_detr_r50，传DEVICE参数
     model.eval()
     for p in model.parameters():
-        p.requires_grad = False
+        p.requires_grad = False  # 双重保险（utils里已冻结，此处可保留也可删除，不影响）
+
 
     # TMM
     tmm = TransformerMaskingMatrix(
@@ -367,6 +373,7 @@ def main():
     lr_history = []
 
     logger.info(f"开始训练（PATCH_RATIO={PATCH_RATIO}），结果保存至: {SAVE_DIR}")
+    logger.info(f"Final patch将单独保存至: {FINAL_PATCH_DIR}")  # 新增日志
 
     global_step = 0
     for epoch in range(NUM_EPOCHS):
@@ -517,9 +524,18 @@ def main():
     if step_history and loss_history:
         plot_training_curves(step_history, loss_history, grad_norm_history, lr_history, VISUAL_DIR, dataloader)
     tmm.remove_hooks()
+    
+    # 修改：将final patch同时保存到两个位置
+    # 1. 原有的SAVE_DIR位置（保持不变）
     save_image(patch[0].detach().cpu(), os.path.join(SAVE_DIR, "final_patch.png"))
     torch.save(patch[0].detach().cpu(), os.path.join(SAVE_DIR, "final_patch.pt"))
-    logger.info(f"训练完成！最终Patch保存至: {SAVE_DIR} | 最终学习率={optimizer.param_groups[0]['lr']:.6f}")
+    
+    # 2. 新增：单独保存到FINAL_PATCH_DIR
+    save_image(patch[0].detach().cpu(), os.path.join(FINAL_PATCH_DIR, "final_patch.png"))
+    torch.save(patch[0].detach().cpu(), os.path.join(FINAL_PATCH_DIR, "final_patch.pt"))
+    
+    logger.info(f"训练完成！最终Patch保存至: {SAVE_DIR}")
+    logger.info(f"Final patch已单独保存至专用目录: {FINAL_PATCH_DIR}")  # 新增日志
 
 if __name__ == "__main__":
     main()

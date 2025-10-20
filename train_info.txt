@@ -1,0 +1,19 @@
+train_saved_files:
+
+# /opt/data/private/BlackBox/save/demo/
+# ├── step_*_orig_with_boxes.png     # 每20步保存的原始图像+检测框
+# ├── step_*_patched_with_boxes.png  # 每20步保存的贴patch图像+检测框
+# ├── step_*_patch.png               # 每20步保存的patch图像
+# ├── epoch_*_patch.png              # 每个epoch保存的patch图像
+# ├── epoch_*_patch.pt               # 每个epoch保存的patch权重
+# ├── final_patch.png                # 最终patch图像
+# └── final_patch.pt                 # 最终patch权重文件
+
+# /opt/data/private/BlackBox/save/final_patch/
+# ├── final_patch.png                # 最终patch图像（单独保存）
+# └── final_patch.pt                 # 最终patch权重文件（单独保存）
+
+# /opt/data/private/BlackBox/save/visual/
+# └── training_visualization.png     # 训练曲线图
+
+# /opt/data/private/BlackBox/save/train.log  # 训练日志

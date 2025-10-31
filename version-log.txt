@@ -1,0 +1,15 @@
+version
+0.5--RATIO=0.5
+0.3--RATIO=0.3
+
+0.1--p_base=0.1（默认0.2）；RATIO=0.5
+
+kl--引入kl（默认deta=0.001）；RATIO=0.5
+kl0.0005--deta=0.0005；RATIO=0.5
+
+po--只+patch out
+cda--只+cda
+
+tt--+cad+patchout； RATIO=0.5
+t--+cad+patchout； RATIO=0.3
+

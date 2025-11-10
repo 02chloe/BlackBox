@@ -1,0 +1,6 @@
+Model,Clean Total,Patched Total,Recall,Recall (%),Reduced Boxes
+DETR,1200,1164,0.97,97.00%,36
+Deformable-DETR,609,563,0.9245,92.45%,46
+Sparse-DETR,653,643,0.9847,98.47%,10
+Anchor-DETR,637,615,0.9655,96.55%,22
+DN-DETR,607,584,0.9621,96.21%,23

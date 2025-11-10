@@ -1,0 +1,6 @@
+﻿Model,Version,Clean Boxes,Patched Boxes,Reduce,Increase,Recall (%),Success Images
+detr,0.1,599,586,18,5,97.83,14
+deformable-detr,0.1,539,332,207,0,61.60,143
+sparse-detr,0.1,549,498,54,3,90.71,46
+anchor-detr,0.1,488,366,125,3,75.00,75
+dn-detr,0.1,492,441,56,5,89.63,45

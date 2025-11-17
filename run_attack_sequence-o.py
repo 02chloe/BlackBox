@@ -1,31 +1,9 @@
 #!/usr/bin/env python3
-"""
-Simple ordered runner for BlackBox utils scripts.
 
-Usage:
-    python run_attack_sequence.py --version 0.5
-    python run_attack_sequence.py --version kl --ratio 0.5
+import os, importlib, pathlib
 
-Behavior:
-- Runs the exact list of scripts in /opt/data/private/BlackBox/utils/ in the specified order.
-- Sets environment variables PATCH_VERSION and PATCH_RATIO for each child process.
-- Uses a stable CUDA/Torch/nvjitlink environment for every child.
-- Stops on first error (non-zero exit) by default.
-"""
-
-import os
-import sys
-import argparse
-import subprocess
-from pathlib import Path
-import importlib
-import pathlib
-
-# --------------------------------------------------
-# 统一构造子进程环境（所有 utils 子脚本都用这个）
-# --------------------------------------------------
-def build_child_env(env_base=None):
-    env = env_base.copy() if env_base is not None else os.environ.copy()
+def build_child_env():
+    env = os.environ.copy()
 
     # 1) LD_LIBRARY_PATH: nvjitlink → cusparse → torch/lib → cuda/lib64 → old
     try:
@@ -33,7 +11,6 @@ def build_child_env(env_base=None):
         nvjitlink_dir = str(pathlib.Path(m.__file__).with_name("lib"))
     except Exception:
         nvjitlink_dir = "/usr/local/lib/python3.8/dist-packages/nvidia/nvjitlink/lib"
-
     cusparse_dir = "/usr/local/lib/python3.8/dist-packages/nvidia/cusparse/lib"
     torch_lib_dir = "/usr/local/lib/python3.8/dist-packages/torch/lib"
     cuda_home    = env.get("CUDA_HOME", "/usr/local/cuda")
@@ -41,7 +18,7 @@ def build_child_env(env_base=None):
 
     ld_parts = []
     for d in (nvjitlink_dir, cusparse_dir, torch_lib_dir, cuda_lib64):
-        if d and os.path.isdir(d):
+        if os.path.isdir(d):
             ld_parts.append(d)
     if env.get("LD_LIBRARY_PATH"):
         ld_parts.append(env["LD_LIBRARY_PATH"])
@@ -56,8 +33,7 @@ def build_child_env(env_base=None):
     py_parts = []
     if env.get("PYTHONPATH"):
         py_parts = [p for p in env["PYTHONPATH"].split(":") if p]
-
-    for d in reversed(ops):  # reversed -> 最终顺序为 ops 列表从前到后
+    for d in reversed(ops):  # insert 到最前
         if os.path.isdir(d) and d not in py_parts:
             py_parts.insert(0, d)
     env["PYTHONPATH"] = ":".join(py_parts)
@@ -65,11 +41,33 @@ def build_child_env(env_base=None):
     return env
 
 
+
+
+"""
+Simple ordered runner for BlackBox utils scripts.
+
+Usage:
+    python run_attack_sequence.py --version 0.5
+    python run_attack_sequence.py --version kl --ratio 0.5
+
+Behavior:
+- Runs the exact list of scripts in /opt/data/private/BlackBox/utils/ in the specified order.
+- Sets environment variables PATCH_VERSION and PATCH_RATIO for each child process.
+- Stops on first error (non-zero exit).
+"""
+
+import os
+import sys
+import argparse
+import subprocess
+from pathlib import Path
+
 # -----------------------
-# Configuration
+# Configuration (edit if you move files)
 # -----------------------
 UTILS_DIR = Path("/opt/data/private/BlackBox/utils").resolve()
 
+# Exact ordered list you provided (must match filenames in utils/).
 SCRIPT_ORDER = [
     "2_past_patch.py",
     "3-create-data.py",
@@ -91,22 +89,18 @@ SCRIPT_ORDER = [
 
 PYTHON = sys.executable  # use same python interpreter
 
-
 # -----------------------
 # CLI
 # -----------------------
 def parse_args():
     p = argparse.ArgumentParser(description="Run ordered BlackBox utils scripts with controlled VERSION.")
-    p.add_argument("--version", "-v", required=True,
-                   help="PATCH_VERSION to pass to child scripts (e.g. '0.5' or 'kl0.0008').")
-    p.add_argument("--ratio", "-r", default=None,
-                   help="Optional PATCH_RATIO to pass to child scripts (e.g. '0.5').")
+    p.add_argument("--version", "-v", required=True, help="PATCH_VERSION to pass to child scripts (e.g. '0.5' or 'kl').")
+    p.add_argument("--ratio", "-r", default=None, help="Optional PATCH_RATIO to pass to child scripts (e.g. '0.5').")
     p.add_argument("--stop-on-error", dest="stop_on_error", action="store_true", default=True,
                    help="Stop on first script error (default).")
     p.add_argument("--no-stop-on-error", dest="stop_on_error", action="store_false",
                    help="Continue even if a script returns non-zero (not recommended).")
     return p.parse_args()
-
 
 # -----------------------
 # Helpers
@@ -131,17 +125,10 @@ def run_script(path: Path, env: dict):
     print("\n" + "="*70)
     print(f"Running: {cmd}")
     print(f"cwd: {path.parent}")
-
-    # 为该脚本构造一个更稳健的运行环境（包含 CUDA / nvjitlink / ops 路径）
-    child_env = build_child_env(env)
-
-    print(f"[env] LD_LIBRARY_PATH={child_env.get('LD_LIBRARY_PATH','')}")
-    print(f"[env] PYTHONPATH={child_env.get('PYTHONPATH','')}")
-
-    res = subprocess.run(cmd, cwd=str(path.parent), env=child_env)
+    # run with subprocess.run so stdout/stderr stream to console
+    res = subprocess.run(cmd, cwd=str(path.parent), env=env)
     print(f"Exit code: {res.returncode}")
     return res.returncode
-
 
 # -----------------------
 # Main
@@ -155,13 +142,14 @@ def main():
         print(f"ERROR: {e}", file=sys.stderr)
         sys.exit(2)
 
+    # resolve script paths and fail early if any missing
     try:
         scripts = build_script_paths(UTILS_DIR, SCRIPT_ORDER)
     except Exception as e:
         print(f"ERROR: {e}", file=sys.stderr)
         sys.exit(2)
 
-    # 基础环境：从当前 os.environ 复制，并注入 PATCH_VERSION/PATCH_RATIO
+    # build environment for child processes
     base_env = os.environ.copy()
     base_env["PATCH_VERSION"] = str(args.version)
     if args.ratio is not None:
@@ -172,11 +160,11 @@ def main():
     if "PATCH_RATIO" in base_env:
         print("PATCH_RATIO =", base_env.get("PATCH_RATIO"))
 
-    # 切到 utils 目录，保证相对路径一致
+    # switch cwd to utils dir for consistent relative paths in child scripts
     os.chdir(str(UTILS_DIR))
     print(f"Changed working dir to {UTILS_DIR}")
 
-    # 按顺序执行
+    # execute scripts in order
     for script_path in scripts:
         code = run_script(script_path, env=base_env)
         if code != 0:

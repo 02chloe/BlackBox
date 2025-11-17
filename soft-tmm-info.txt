@@ -1,0 +1,292 @@
+---
+
+## 一、soft TMM 本身的所有参数
+
+### 1. `soft_mask_ratio` ✅（最关键）
+
+**定义（soft_tmm.TransformerMaskingMatrix 中）：**
+
+```python
+TransformerMaskingMatrix(
+    num_enc_layers=6,
+    num_dec_layers=6,
+    soft_mask_ratio=0.3,
+    sampling_strategy='categorical',
+    device=...,
+    tau=1.0,
+)
+```
+
+**含义：**
+
+> Soft-TMM 的“**最大衰减比例**”。
+
+* 掩码形如：
+  [
+  M = 1 - \text{soft_mask_ratio} \cdot p
+  ]
+  其中 (p \in (0,1)) 是由梯度重要性映射出来的“注意力”。
+* 最极端的高梯度区域，p≈1 时：
+  [
+  M_{\min} \approx 1 - \text{soft_mask_ratio}
+  ]
+  也就是——**最多被“打到”这个比例**。
+
+举例：
+
+* `soft_mask_ratio = 0.3` → 最敏感位置最多被乘到 `0.7`。
+* `soft_mask_ratio = 0.5` → 最敏感位置最多被乘到 `0.5`。
+* `soft_mask_ratio = 0.1` → 最敏感位置最多被乘到 `0.9`，几乎“不怎么掩”。
+
+**默认值：**
+`soft_mask_ratio = 0.3`
+
+**调大 / 调小的影响：**
+
+* 调大（0.3 → 0.4 / 0.5）：
+
+  * 优点：
+
+    * 对高梯度特征抑制更狠，强制 patch 在“骨干特征被压制”的条件下依然有效；
+    * 理论上有利于提升 **跨模型迁移性、鲁棒性**。
+  * 风险：
+
+    * 对 DETR 表征扰动太强，训练更难收敛，loss 抖动加剧；
+    * 可能出现“攻击通过破坏 backbone 达成”的倾向。
+
+* 调小（0.3 → 0.2 / 0.1）：
+
+  * 优点：
+
+    * 训练更稳定，loss 曲线更平滑；
+    * 白盒模型上攻击效果可能更好看。
+  * 风险：
+
+    * TMM 的 regularization 变弱，对**迁移性**帮助变小，更接近“普通 patch 训练”。
+
+**建议：**
+
+* 首轮实验：`0.2 ~ 0.4` 区间扫一圈；
+* 想要“强 regularization”版本：`0.4` 可以试；
+* 想做对照组：可以设一个 `soft_mask_ratio = 0.0` 的实验，相当于“关掉 soft TMM”。
+
+---
+
+### 2. `tau` ✅（温度，控制“重要性分布”的陡峭程度）
+
+**出现场景：**
+
+```python
+g_norm = (g - mean) / (std + 1e-6)
+p = torch.sigmoid(g_norm / self.tau)
+M = 1.0 - self.soft_mask_ratio * p
+```
+
+* g：按通道均值后的梯度强度（B×1×H×W 或 B×S×1）
+* g_norm：全局标准化后的梯度强度
+* 通过 `sigmoid(g_norm / tau)` 把它映射到 (0,1)
+
+**含义：**
+
+* `tau` 控制：**梯度强度差异在 p 空间中表现得多“尖锐”**。
+* 小 tau → g_norm / tau 的绝对值变大 → sigmoid 更接近 0 或 1 → 重要性“二极分化”。
+* 大 tau → g_norm / tau 被压扁 → sigmoid 都在 0.3~0.7 之间 → 重要性更平滑。
+
+**默认值：**
+`tau = 1.0`
+
+**调节效果：**
+
+* `tau ↓` 例如 1.0 → 0.7 → 0.5：
+
+  * 高梯度区域 p 更接近 1，低梯度区域更接近 0；
+  * 掩码 M 在空间上的对比度更强：
+
+    * 高梯度位置：M ≈ `1 - soft_mask_ratio`；
+    * 低梯度位置：M ≈ 1；
+  * 更像“集中火力打最敏感 token”。
+
+* `tau ↑` 例如 1.0 → 1.5 → 2.0：
+
+  * 所有 p 值靠近中间 → 掩码更均匀；
+  * 更接近“整体乘一个柔和的 alpha”，TMM 力度变温和。
+
+**建议：**
+
+* 初始：`tau = 1.0` 做 baseline；
+* 若你觉得 soft-TMM 的空间掩码“太激进”，可将 tau 轻微调大到 `1.5`；
+* 若你想更集中打击极少数最敏感 token，可试 `tau=0.7` 或 `0.5`，注意配合 KL/总 loss 看训练是否不稳定。
+
+---
+
+### 3. `num_enc_layers` / `num_dec_layers`
+
+**含义：**
+
+* 指定在 **前多少个 encoder / decoder 层** 插入 hook 使用 soft 掩码。
+* 在 `register_hooks` 中：
+
+```python
+assert len(base_model.transformer.encoder.layers) >= self.num_enc_layers
+assert len(base_model.transformer.decoder.layers) >= self.num_dec_layers
+self._register_layer_hooks(..., prefix="enc")
+self._register_layer_hooks(..., prefix="dec")
+```
+
+**默认值：**
+
+* `num_enc_layers = 6`
+* `num_dec_layers = 6`
+  → 对标准 DETR（6 encoder + 6 decoder）而言，相当于“所有层都加 soft TMM”。
+
+**调节效果：**
+
+* 减少层数（如 6 → 3）：
+
+  * Soft TMM 只作用于前 3 层 encoder/decoder；
+  * 后几层保持原始特征流；
+  * 训练更稳定、计算略微减少；
+  * Regularization 深度变浅，对 patch 的“不依赖浅层特征”约束减弱。
+
+* 只对 encoder / decoder 其中一侧用：
+
+  * `num_enc_layers=6, num_dec_layers=0`：只扰动 encoder（更多偏 backbone 表征）；
+  * `num_enc_layers=0, num_dec_layers=6`：只扰动 decoder（偏 query 对特征的读取视角）。
+
+**建议：**
+
+* 和 BlackBox 原设置对齐：**先用 6/6**。
+* 做 ablation 时可以测：
+
+  * (6, 0)、(0, 6)、(3, 3) 几种结构，看对迁移性/白盒性能的影响。
+
+---
+
+### 4. `sampling_strategy`（目前 soft 模式下基本是“占位参数”）
+
+**含义：**
+
+* 原硬 TMM 的参数：`'categorical'` / `'bernoulli'` 用于决定“怎么随机采样 mask”。
+* 在 soft_tmm 中仍保留此参数，但实际 soft 掩码逻辑并 **不依赖** 它：
+
+  * `_categorical_mask_sampling` 还在，但默认不会被调用；
+  * 真正使用的是 `_apply_mask_to_input()` 里的连续缩放。
+
+**默认值：**
+
+* `'categorical'`
+
+**影响：**
+
+* 在当前 soft_tmm 实现下，改变 `sampling_strategy` **不会影响行为**。
+* 保留它主要是为了接口兼容，未来你想混合“硬采样 + 软缩放”时可以复用这层抽象。
+
+---
+
+### 5. `device`
+
+**含义：**
+
+* 指定 soft TMM 内部新建张量的设备（CPU / GPU）。
+* 你在训练脚本中是：
+
+```python
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+tmm = TransformerMaskingMatrix(
+    ...,
+    device=DEVICE,
+    ...
+)
+```
+
+**默认行为：**
+
+* 若不显式传入，则自动：
+  `cuda if available else cpu`
+
+**建议：**
+
+* 始终和主模型的 device 保持一致即可；
+* 多 GPU/CPU 混合场景下再考虑特殊调整，正常训练不需要动。
+
+---
+
+## 二、训练脚本里与 soft TMM 强耦合的参数
+
+虽然不是 soft_tmm 类里定义的，但和它配合得很紧：
+
+### 6. `PATCH_RATIO`（外部训练脚本）
+
+**含义：**
+
+* 决定 patch 相对目标框**短边**的比例：
+
+```python
+short = min(box_w, box_h)
+side = max(MIN_PATCH_PX, int(round(short * PATCH_RATIO)))
+```
+
+* 理论上：
+
+  * 大 `PATCH_RATIO` → patch 更占画面，攻击更强但更显眼；
+  * 小 `PATCH_RATIO` → patch 更隐蔽，但攻击难度变大。
+
+**和 soft TMM 的联动：**
+
+* 如果你把 soft 掩码搞得很狠（soft_mask_ratio 高、tau 小），可以适当给 patch 多一点“像素预算”（稍微增大 PATCH_RATIO），防止训练完全崩掉；
+* 相反，soft-TMM 较温和时，可以尝试略小的 PATCH_RATIO，看是否能保持攻击效果的同时减小视觉扰动。
+
+---
+
+## 三、综合调参建议（你可以按这套来做实验设计）
+
+### 1. 推荐的“基础配置”组合
+
+起步 baseline：
+
+* `soft_mask_ratio = 0.3`
+* `tau = 1.0`
+* `num_enc_layers = 6`
+* `num_dec_layers = 6`
+* `PATCH_RATIO = 0.5`
+
+建议作为：**Soft-TMM + 无 KL 的标准 baseline**。
+
+---
+
+### 2. 系统性超参扫法（重点在 soft_mask_ratio & tau）
+
+你可以设计一个小网格：
+
+* `soft_mask_ratio ∈ {0.2, 0.3, 0.4}`
+* `tau ∈ {0.7, 1.0, 1.5}`
+
+其他参数先固定（如 PATCH_RATIO=0.5）。
+
+这样有 3×3=9 组组合，你可以：
+
+* 看 DETR 自身训练过程中 `total_loss`、`det_loss` 是否稳定；
+* 用同一个 patch 去攻击 Deformable、Sparse、DN、Anchor，看 recall 的 drop。
+
+**经验倾向：**
+
+* `soft_mask_ratio=0.3, tau=1.0`：非常适合作为起点；
+* 若你看到训练很稳、迁移提升不明显：
+  → 可以试 `soft_mask_ratio=0.4, tau=1.0`；
+* 若你看到 loss 抖动大、KL 已经在“压模型”：
+  → 可以退一点：`soft_mask_ratio=0.2` 或 `tau=1.5`。
+
+---
+
+### 3. 写论文/报告时可以这样描述 soft TMM
+
+> We replace the original hard Transformer Masking Matrix (TMM) with a soft variant, where the feature maps at selected encoder and decoder layers are modulated by a continuous mask (M \in [1-\alpha, 1]).
+> The mask is derived from the normalized gradient magnitude via a temperature-controlled sigmoid, and (\alpha) (our `soft_mask_ratio`) controls the maximum attenuation strength.
+> This design preserves gradient flow while encouraging the adversarial patch to remain effective under systematically weakened, gradient-sensitive features, which empirically improves cross-model transferability.
+
+把这里的 (\alpha) 对应到你实验里 soft_mask_ratio 的数值就行。
+
+---
+
+如果你接下来准备把 **soft TMM + KL 一起用**，我们还可以再加一层“交互调参建议”：比如 soft_mask_ratio 太大 + KL β 也太大时会不会“过正则”，那块我也可以帮你设计一个 2D 表（β × soft_mask_ratio），方便你做系统实验。

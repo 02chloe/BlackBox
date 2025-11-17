@@ -1,0 +1,72 @@
+训练：
+
+cd /opt/data/private/BlackBox/
+python train_t14-softmask.py --version soft0.5 --soft_mask_ratio 0.5
+
+# blackbox-soft-tmm 完整版 标准默认
+python train_t10-softmask.py \
+    --version soft-baseline \
+    --soft_mask_ratio 0.3 \
+    --tau 1.0 \
+    --patch_ratio 0.5
+
+
+python train_t14-softmask.py --version soft-0.3 --soft_mask_ratio 0.3 --tau 1.0 --patch_ratio 0.5 && \
+python train_t14-softmask.py --version soft-0.7 --soft_mask_ratio 0.7 --tau 1.0 --patch_ratio 0.5 && \
+python train_t14-softmask.py --version soft-0.9 --soft_mask_ratio 0.9 --tau 1.0 --patch_ratio 0.5
+
+
+
+
+python run_attack_sequence.py --version soft-0.3 && \
+python run_attack_sequence.py --version soft-0.7 && \
+python run_attack_sequence.py --version soft-0.9 
+
+
+
+
+base0.1_kl0.001
+cd /opt/data/private/BlackBox
+python train_t13_.py --version base0.1_kl0.0005 --beta 0.0005 --p_base 0.1 && \
+python train_t13_.py --version base0.1_kl0.0008 --beta 0.0008 --p_base 0.1 && \
+python train_t13_.py --version base0.1_kl0.0012 --beta 0.0012 --p_base 0.1 && \
+python train_t13_.py --version base0.1_kl0.0015 --beta 0.0015 --p_base 0.1
+
+python run_attack_sequence.py --version base0.1_kl0.0005 && \
+python run_attack_sequence.py --version base0.1_kl0.0008 && \
+python run_attack_sequence.py --version base0.1_kl0.0012 && \
+python run_attack_sequence.py --version base0.1_kl0.0015  
+
+
+# blackbox-kl-soft-tmm:
+cd /opt/data/private/BlackBox
+
+python train_t15_kl-soft.py \
+  --version kl_soft0.3 \
+  --soft_mask_ratio 0.3 \
+  --soft_tau 1.0 \
+  --kl_beta 0.0015
+
+
+cd /opt/data/private/BlackBox && \
+python train_t15_kl-soft.py --version kl_soft0.1 --soft_mask_ratio 0.1 --soft_tau 1.0 --kl_beta 0.001 && \
+python train_t15_kl-soft.py --version kl_soft0.3 --soft_mask_ratio 0.3 --soft_tau 1.0 --kl_beta 0.001 && \
+python train_t15_kl-soft.py --version kl_soft0.5 --soft_mask_ratio 0.5 --soft_tau 1.0 --kl_beta 0.001 && \
+python train_t15_kl-soft.py --version kl_soft0.7 --soft_mask_ratio 0.7 --soft_tau 1.0 --kl_beta 0.001 && \
+python train_t15_kl-soft.py --version kl_soft0.9 --soft_mask_ratio 0.9 --soft_tau 1.0 --kl_beta 0.001
+
+
+
+Attack：
+
+cd /opt/data/private/BlackBox/ 
+python run_attack_sequence.py --version kl0.0012
+
+
+python run_attack_sequence.py --version kl_soft0.9 && \
+python run_attack_sequence.py --version kl_soft0.7 && \
+python run_attack_sequence.py --version kl_soft0.5 && \
+python run_attack_sequence.py --version kl_soft0.3 && \
+python run_attack_sequence.py --version kl_soft0.1 
+
+
